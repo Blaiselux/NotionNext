@@ -1,1 +1,10 @@
 .next*
+.git
+.github
+.vitepress
+.env*
+docs
+__tests__
+node_modules
+*.log
+Dockerfile.cindy-*
