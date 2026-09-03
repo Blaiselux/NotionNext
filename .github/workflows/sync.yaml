@@ -1,65 +1,116 @@
-name: Upstream Sync
-
-permissions:
-  contents: write
+name: Propose upstream update
 
 on:
   schedule:
-    - cron: '0 1 * * *' # UTC 01:00，北京时间约 09:00
+    - cron: '0 1 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: notionnext-upstream-update
+  cancel-in-progress: false
+
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
-    runs-on: ubuntu-latest
+  propose-update:
+    name: Create or refresh the upstream update PR
     if: ${{ github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      UPDATE_BRANCH: automation/upstream-sync
 
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
+      - name: Require the existing repository PAT
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo 'The PAT repository secret is required to create a PR that triggers CI.' >&2
+            exit 1
+          fi
+
+      - name: Check out the fork
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
           token: ${{ secrets.PAT }}
 
-      - name: Sync upstream while preserving fork settings
+      - name: Merge upstream into a review branch
+        id: update
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "1. 备份自定义同步脚本..."
-          cp .github/workflows/sync.yaml /tmp/sync.yaml
-
-          echo "2. 配置 Git 机器人..."
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          echo "3. 获取上游最新代码..."
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream https://github.com/notionnext-org/NotionNext.git
           git fetch upstream main
 
-          echo "4. 重置到上游 main..."
-          git reset --hard upstream/main
-
-          echo "5. 恢复自定义同步脚本，并移除不适用于 Vercel fork 的工作流..."
-          mkdir -p .github/workflows
-          cp /tmp/sync.yaml .github/workflows/sync.yaml
-          rm -f \
-            .github/workflows/deploy-docs-site.yml \
-            .github/workflows/docker-ghcr.yaml \
-            .github/workflows/bump-version-on-main.yml \
-            .github/workflows/labeler.yml \
-            .github/workflows/stale.yml \
-            .github/workflows/originality-proofs.yml
-
-          git add -A
-
-          echo "6. 检查同步后的仓库是否真的发生变化..."
-          if git diff --cached --quiet origin/main; then
-            echo "上游没有产生需要同步的变化，无需提交或部署。"
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo 'No upstream update is available.'
+            echo 'changed=false' >>"${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          echo "7. 提交并安全更新 fork..."
-          git commit -m "chore: sync upstream while preserving fork workflows"
-          git push origin HEAD:main --force-with-lease
+          git fetch origin "${UPDATE_BRANCH}:refs/remotes/origin/${UPDATE_BRANCH}" || true
+          git checkout --force -B "${UPDATE_BRANCH}" origin/main
+
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          merge_status=$?
+          set -e
+
+          # These files define this fork's safe deployment path and must not be
+          # replaced by upstream's generic Vercel/GHCR workflows.
+          protected_paths=(
+            .dockerignore
+            Dockerfile
+            .github/workflows/ci.yml
+            .github/workflows/sync.yaml
+            .github/workflows/deploy-vps.yml
+            scripts/deploy
+          )
+          for path in "${protected_paths[@]}"; do
+            git checkout origin/main -- "$path"
+          done
+
+          git rm --force --ignore-unmatch \
+            .github/workflows/bump-version-on-main.yml \
+            .github/workflows/deploy-docs-site.yml \
+            .github/workflows/docker-ghcr.yaml \
+            .github/workflows/labeler.yml \
+            .github/workflows/originality-proofs.yml \
+            .github/workflows/stale.yml
+          git add --all
+
+          if git ls-files --unmerged | grep -q .; then
+            echo 'Upstream contains conflicts outside the protected deployment files:' >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          fi
+
+          if [ "$merge_status" -ne 0 ]; then
+            echo 'All merge conflicts were limited to protected files and were resolved with fork versions.'
+          fi
+
+          git commit -m 'chore: propose upstream NotionNext update'
+          git push --force-with-lease origin "HEAD:${UPDATE_BRANCH}"
+          echo 'changed=true' >>"${GITHUB_OUTPUT}"
+
+      - name: Create the review pull request
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh pr view "${UPDATE_BRANCH}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo 'The existing upstream update PR was refreshed.'
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${UPDATE_BRANCH}" \
+              --title 'chore: review upstream NotionNext update' \
+              --body 'Automated upstream update. Wait for every required check to pass, review the upstream changes, then merge to deploy.'
+          fi

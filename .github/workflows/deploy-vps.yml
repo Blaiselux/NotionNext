@@ -1,0 +1,120 @@
+name: Build and deploy VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Commit, tag, or branch to rebuild and deploy
+        required: false
+        default: main
+
+concurrency:
+  group: notionnext-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify application
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn lint
+      - run: yarn type-check
+      - run: yarn test --runInBand --passWithNoTests
+      - run: yarn deps:check-lockfile
+
+  build:
+    name: Build immutable production image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.version.outputs.image_tag }}
+    env:
+      NOTIONNEXT_ENV_LOCAL: ${{ secrets.NOTIONNEXT_ENV_LOCAL }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - name: Resolve immutable image tag
+        id: version
+        shell: bash
+        run: echo "image_tag=sha-$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/blaiselux/notionnext:${{ steps.version.outputs.image_tag }}
+            ghcr.io/blaiselux/notionnext:production
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secret-envs: |
+            env_local=NOTIONNEXT_ENV_LOCAL
+          provenance: mode=max
+          sbom: true
+
+  deploy:
+    name: Blue/green deploy to Chengdu VPS
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Deploy the tested image with an ephemeral registry token
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${VPS_KNOWN_HOSTS}" >"${HOME}/.ssh/known_hosts"
+          chmod 0600 "${HOME}/.ssh/known_hosts"
+
+          key_file=$(mktemp)
+          trap 'rm -f "${key_file}"' EXIT
+          printf '%s\n' "${VPS_DEPLOY_KEY}" >"${key_file}"
+          chmod 0600 "${key_file}"
+
+          printf '%s\n' "${GHCR_TOKEN}" | ssh \
+            -i "${key_file}" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "notionnext-deploy@${VPS_HOST}" \
+            "deploy ${{ needs.build.outputs.image_tag }} ${GITHUB_ACTOR}"
+
+      - name: Verify the public site
+        run: curl --fail --silent --show-error --max-time 30 https://ashway.fun/ >/dev/null

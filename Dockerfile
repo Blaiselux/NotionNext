@@ -1,5 +1,4 @@
-ARG NOTION_PAGE_ID
-ARG NEXT_PUBLIC_THEME
+# syntax=docker/dockerfile:1.7
 
 FROM node:22-alpine AS base
 
@@ -14,13 +13,16 @@ RUN yarn install --frozen-lockfile --network-timeout 600000
 # 2. Rebuild the source code only when needed
 FROM base AS builder
 ARG NOTION_PAGE_ID
+ARG NEXT_PUBLIC_THEME
 ENV NEXT_BUILD_STANDALONE=true
+ENV NEXT_TELEMETRY_DISABLED=1
 
 WORKDIR /app
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN yarn build
+RUN --mount=type=secret,id=env_local,target=/app/.env.local,required=false \
+    yarn build
 
 # 3. Production image, copy all the files and run next
 FROM base AS runner
@@ -28,17 +30,19 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
-COPY --from=builder /app/public ./public
+COPY --from=builder --chown=node:node /app/public ./public
 
 # Automatically leverage output traces to reduce image size
 # https://nextjs.org/docs/advanced-features/output-file-tracing
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
 
 # 个人仓库把将配置好的.env.local文件放到项目根目录，可自动使用环境变量
 # COPY --from=builder /app/.env.local ./
 
 EXPOSE 3000
+
+USER node
 
 # Next.js collects completely anonymous telemetry data about general usage.
 # Learn more here: https://nextjs.org/telemetry
