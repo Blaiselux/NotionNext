@@ -4,6 +4,8 @@ permissions:
   contents: write
 
 on:
+  schedule:
+    - cron: '0 1 * * *' # UTC 01:00，北京时间约 09:00
   workflow_dispatch:
 
 jobs:
@@ -13,25 +15,51 @@ jobs:
     if: ${{ github.event.repository.fork }}
 
     steps:
-      # Step 1: run a standard checkout action
       - name: Checkout target repo
-        uses: actions/checkout@v7
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        uses: actions/checkout@v4
         with:
-          upstream_sync_repo: notionnext-org/NotionNext
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.PAT }}
 
-          # Set test_mode true to run tests instead of the true action!!
-          test_mode: false
-
-      - name: Sync check
-        if: failure()
+      - name: Sync upstream while preserving fork settings
+        shell: bash
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，你需要手动 Sync Fork 一次。"
-          exit 1
+          set -euo pipefail
+
+          echo "1. 备份自定义同步脚本..."
+          cp .github/workflows/sync.yaml /tmp/sync.yaml
+
+          echo "2. 配置 Git 机器人..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "3. 获取上游最新代码..."
+          git remote add upstream https://github.com/notionnext-org/NotionNext.git
+          git fetch upstream main
+
+          echo "4. 重置到上游 main..."
+          git reset --hard upstream/main
+
+          echo "5. 恢复自定义同步脚本，并移除不适用于 Vercel fork 的工作流..."
+          mkdir -p .github/workflows
+          cp /tmp/sync.yaml .github/workflows/sync.yaml
+          rm -f \
+            .github/workflows/deploy-docs-site.yml \
+            .github/workflows/docker-ghcr.yaml \
+            .github/workflows/bump-version-on-main.yml \
+            .github/workflows/labeler.yml \
+            .github/workflows/stale.yml \
+            .github/workflows/originality-proofs.yml
+
+          git add -A
+
+          echo "6. 检查同步后的仓库是否真的发生变化..."
+          if git diff --cached --quiet origin/main; then
+            echo "上游没有产生需要同步的变化，无需提交或部署。"
+            exit 0
+          fi
+
+          echo "7. 提交并安全更新 fork..."
+          git commit -m "chore: sync upstream while preserving fork workflows"
+          git push origin HEAD:main --force-with-lease
