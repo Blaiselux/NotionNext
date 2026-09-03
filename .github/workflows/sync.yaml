@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -19,23 +20,15 @@ jobs:
     if: ${{ github.event.repository.fork }}
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.PAT }}
+      GH_TOKEN: ${{ github.token }}
       UPDATE_BRANCH: automation/upstream-sync
 
     steps:
-      - name: Require the existing repository PAT
-        run: |
-          if [ -z "${GH_TOKEN}" ]; then
-            echo 'The PAT repository secret is required to create a PR that triggers CI.' >&2
-            exit 1
-          fi
-
       - name: Check out the fork
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
-          token: ${{ secrets.PAT }}
 
       - name: Merge upstream into a review branch
         id: update
@@ -114,3 +107,7 @@ jobs:
               --title 'chore: review upstream NotionNext update' \
               --body 'Automated upstream update. Wait for every required check to pass, review the upstream changes, then merge to deploy.'
           fi
+
+      - name: Run CI for the bot-created branch
+        if: steps.update.outputs.changed == 'true'
+        run: gh workflow run ci.yml --ref "${UPDATE_BRANCH}"
